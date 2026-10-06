@@ -4,6 +4,8 @@
 
 ### Features
 
+- **Mental model injection** — New opt-in `mentalModelsEnabled` config fetches the bank's mental models once per session and injects them ephemerally each turn via the same context-handler mechanics as auto-recall (configured role, never written to the session file, so prompt caching is preserved). Non-placeholder `autoRecallTags` scope which models are fetched. Failures degrade silently like auto-recall. New `/hindsight models` subcommand lists the bank's mental models (id, name, last refresh, content preview) and `models refresh <id>` triggers a server-side refresh; the subcommand is operational (blocked in degraded mode). Uses the official client library's existing mental model APIs (`listMentalModels`, `getMentalModel`, `refreshMentalModel`) — no new dependencies. Env vars: `EPIMETHEUS_MENTAL_MODELS_ENABLED`, `EPIMETHEUS_MENTAL_MODELS_TIMEOUT_MS` (`mentalModelsTimeoutMs`, default `10000`, same timer validation as `recallTimeoutMs`).
+
 - **`recallTimeoutMs` config** — Recall request timeouts are now configurable (previously hard-coded to 10 seconds). The new `recallTimeoutMs` setting (milliseconds, default `10000`) applies to both auto-recall and the `hindsight_recall` tool, which shared the same hard-coded timeout. On timeout, recall fails as before — there is no retry or degraded fallback, so tune `recallTimeoutMs` together with `autoRecallBudget`/`maxRecallTokens` for large memory banks (e.g. `30000`). Invalid values warn and fall back to the default. Env vars: `EPIMETHEUS_RECALL_TIMEOUT_MS` (legacy fallback: `PI_HINDSIGHT_RECALL_TIMEOUT_MS`).
 
 ### Fixed

@@ -8,6 +8,7 @@ import {
   HindsightClient,
   HindsightError,
   type MemoryItemInput,
+  type MentalModelResponse,
   type RecallResponse,
   type ReflectResponse,
 } from "@vectorize-io/hindsight-client";
@@ -57,6 +58,10 @@ export interface ReflectOptions {
   // - response_schema: not adding for now as structured output seems less useful
   //   for coding agent integration
   // - include: can be added later if needed (for trace, facts, chunks, etc.)
+}
+
+export interface ListMentalModelsOptions {
+  tags?: string[];
 }
 
 export class HindsightClientWrapper {
@@ -294,6 +299,77 @@ export class HindsightClientWrapper {
       );
 
       return { success: true, response: result };
+    } catch (e) {
+      return { success: false, error: this.formatError(e) };
+    }
+  }
+
+  /**
+   * List the bank's mental models with their content, filtered by tags.
+   * Uses the SDK's listMentalModels (the generated SDK's `detail` query param
+   * is not exposed by the simplified client; the default response includes
+   * content). Returns the raw `items` array from the server.
+   */
+  async listMentalModels(
+    options: ListMentalModelsOptions = {},
+    signal?: AbortSignal,
+    timeoutMs: number = this.config.mentalModelsTimeoutMs
+  ): Promise<{ success: boolean; items?: MentalModelResponse[]; error?: string }> {
+    try {
+      const result = await this.withTimeout(
+        this.client.listMentalModels(this.config.bankId, {
+          tags: options.tags,
+        }),
+        timeoutMs,
+        signal
+      );
+      return { success: true, items: result.items ?? [] };
+    } catch (e) {
+      return { success: false, error: this.formatError(e) };
+    }
+  }
+
+  /**
+   * Fetch one mental model's full content by ID.
+   */
+  async getMentalModel(
+    mentalModelId: string,
+    signal?: AbortSignal,
+    timeoutMs: number = this.config.mentalModelsTimeoutMs
+  ): Promise<{ success: boolean; model?: MentalModelResponse; error?: string }> {
+    try {
+      const model = await this.withTimeout(
+        this.client.getMentalModel(this.config.bankId, mentalModelId),
+        timeoutMs,
+        signal
+      );
+      return { success: true, model };
+    } catch (e) {
+      return { success: false, error: this.formatError(e) };
+    }
+  }
+
+  /**
+   * Trigger a server-side refresh of one mental model (manual, user-initiated
+   * only — there is no automatic client-side refresh). Refresh runs async
+   * server-side; the response carries the operation ID, not the new content.
+   */
+  async refreshMentalModel(
+    mentalModelId: string,
+    signal?: AbortSignal,
+    timeoutMs: number = this.config.mentalModelsTimeoutMs
+  ): Promise<{
+    success: boolean;
+    operation?: { operation_id: string; status: string };
+    error?: string;
+  }> {
+    try {
+      const operation = await this.withTimeout(
+        this.client.refreshMentalModel(this.config.bankId, mentalModelId),
+        timeoutMs,
+        signal
+      );
+      return { success: true, operation };
     } catch (e) {
       return { success: false, error: this.formatError(e) };
     }

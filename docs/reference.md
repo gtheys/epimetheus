@@ -11,6 +11,7 @@ Detailed configuration, tools, commands, and operational details for epimetheus.
     - [Overlap: `quit` in both lists](#overlap-quit-in-both-lists)
   - [Auto-Recall Settings](#auto-recall-settings)
     - [autoRecallPersist Tradeoffs](#autorecallpersist-tradeoffs)
+  - [Mental Model Injection](#mental-model-injection)
   - [Status Bar Indicator](#status-bar-indicator)
   - [Session Retention Control](#session-retention-control)
   - [Extra Context & Flush Guard](#extra-context--flush-guard)
@@ -146,7 +147,23 @@ On old versions of epimetheus, the downside of autoRecallPersist was old recall 
 
 If you stop using Hindsight and have sessions with persisted recall entries, you can keep epimetheus installed with `enabled: false` to continue filtering **legacy `custom_message`** entries from context, or manually remove them from session files. This only matters for recall persisted by epimetheus 0.6.1 or earlier and is no longer a concern for the current extension. See [Disabled Mode](#disabled-mode) for details.
 
-## Status Bar Indicator
+### Mental Model Injection
+
+Mental models are cached reflect results stored on the Hindsight server (created via `hindsight-embed`, the Hindsight UI, or the API). With injection enabled, epimetheus fetches them once per session and injects them ephemerally each turn via the `context` handler, using the same role and injection mechanics as auto-recall.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `mentalModelsEnabled` | `false` | Fetch the bank's mental models on session start and inject them ephemerally every turn. Content is never written to the session file, so prompt caching is preserved. |
+| `mentalModelsTimeoutMs` | `10000` | Timeout in milliseconds for mental model fetch/refresh requests. |
+
+Notes:
+
+- **Static injection**: mental models change only when the server refreshes them (manually or via `refresh_after_consolidation`), so the block fetched at session start is re-injected each turn until the next session start. Recall, by contrast, is queried fresh per turn.
+- **Tag scoping**: when `autoRecallTags` is set, non-placeholder tags (e.g. `project:myapp`) are passed to the mental models list call, so project-scoped recall setups also scope mental models. Placeholder tags (`{session}`, `{parent}`, etc.) are skipped because curated models never carry session-scoped tags.
+- **Failure handling**: like auto-recall, a failed fetch degrades silently (debug log only) and the session runs without the block.
+- **No creation/management**: mental models are created and curated outside this extension (`hindsight-embed`, Hindsight UI, or API). See [Slash Commands](#slash-commands) for the `models` subcommands.
+
+# Status Bar Indicator
 The extension shows a health indicator in pi's status bar:
 - 🧠 (healthy) — Config is valid with no warnings or errors
 - 🤯 (unhealthy) — Config has validation errors or load warnings
@@ -687,6 +704,7 @@ All commands are under `/hindsight <subcommand>`. With no subcommand, defaults t
 | `detach-project-name` | Stop requiring the cwd-local `projectName` for this session. See [Project-local Settings](#project-local-settings). |
 | `toggle-display` | Toggle recall message visibility in UI |
 | `popup` | Pop up last recalled messages in overlay |
+| `models` | List the bank's mental models (id, name, last refresh, content preview). `models refresh <id>` triggers a server-side refresh of one model. Blocked in degraded mode (network subcommand). |
 | `status` | Show operational status (connection, session, recall info, queue count) |
 | `config` | Show configuration (file path, env vars, masked config) |
 | `active-tools` | Show active and registered tool names with per-Hindsight-tool registration diagnostics (for debugging tool visibility). Only available in [debug mode](#debug-mode). |

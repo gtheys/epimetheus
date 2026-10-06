@@ -125,6 +125,10 @@ export interface HindsightConfig {
   debug: boolean;
   entities: EntityInput[];
   observationScopes: ObservationScopes;
+  /** Inject the bank's mental models ephemerally at session start. Default: false. */
+  mentalModelsEnabled: boolean;
+  /** Per-request timeout in milliseconds for mental model fetch/refresh requests. Default: 10_000. */
+  mentalModelsTimeoutMs: number;
   statusHealthy: string;
   statusUnhealthy: string;
   /** Auto-flush the current session when these lifecycle events occur. */
@@ -204,6 +208,8 @@ const DEFAULT_CONFIG: HindsightConfig = {
   requireExtraContextBeforeFlush: false,
   entities: [],
   observationScopes: null,
+  mentalModelsEnabled: false,
+  mentalModelsTimeoutMs: 10_000,
   statusHealthy: "🧠",
   statusUnhealthy: "🤯",
   debug: false,
@@ -242,6 +248,8 @@ const VALID_CONFIG_KEYS = new Set<keyof HindsightConfig>([
   "debug",
   "entities",
   "observationScopes",
+  "mentalModelsEnabled",
+  "mentalModelsTimeoutMs",
   "statusHealthy",
   "statusUnhealthy",
   "autoFlushSessionOn",
@@ -583,12 +591,19 @@ function setConfigValue(
     case "autoRecallPersist":
     case "retainSessionsByDefault":
     case "requireExtraContextBeforeFlush":
+    case "mentalModelsEnabled":
     case "debug": {
       if (typeof value === "boolean") {
         config[key] = value;
         return;
       }
       const result = parseBoolean(String(value), DEFAULT_CONFIG[key] as boolean);
+      config[key] = result.value;
+      return result.warning;
+    }
+
+    case "mentalModelsTimeoutMs": {
+      const result = parseTimerDelay(value, DEFAULT_CONFIG.mentalModelsTimeoutMs, key);
       config[key] = result.value;
       return result.warning;
     }
@@ -1293,6 +1308,14 @@ export function loadConfig(extensionsDir?: string): {
       configKey: "observationScopes",
       preferred: "EPIMETHEUS_OBSERVATION_SCOPES",
       legacy: ["PI_HINDSIGHT_OBSERVATION_SCOPES"],
+    },
+    {
+      configKey: "mentalModelsEnabled",
+      preferred: "EPIMETHEUS_MENTAL_MODELS_ENABLED",
+    },
+    {
+      configKey: "mentalModelsTimeoutMs",
+      preferred: "EPIMETHEUS_MENTAL_MODELS_TIMEOUT_MS",
     },
     {
       configKey: "statusHealthy",

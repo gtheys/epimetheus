@@ -25,6 +25,7 @@ import {
   getRegisteredHindsightTools,
 } from "../runtime-state";
 import { createDetachProjectNameSubcommand } from "./detach-project-name";
+import { createMentalModelsSubcommand } from "./mental-models";
 import {
   createExtraContextSubcommand,
   createRemoveTagSubcommand,
@@ -355,6 +356,9 @@ export function registerCommands(
     "tag",
     "remove-tag",
     "set-extra-context",
+    // Network subcommand (lists bank mental models; `models refresh <id>`
+    // additionally triggers a server-side refresh write).
+    "models",
   ]);
 
   // Display-only, but only meaningful when auto-recall can run and cache a
@@ -395,6 +399,7 @@ export function registerCommands(
       setAutoRecallDisplayOverride
     ),
     popup: createPopupSubcommand(getRecallDetails),
+    models: createMentalModelsSubcommand(client, config),
     status: createStatusSubcommand(client, config, getRecallDetails),
     config: createConfigSubcommand(config, configMeta),
   };

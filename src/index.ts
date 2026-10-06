@@ -23,6 +23,7 @@ import { prefixLog, STATUS_ID } from "./constants";
 import { getDataDir } from "./data-dir";
 import { getLegacyDataDir, migrateDataDir } from "./data-dir-migration";
 import { debugError, debugLog, debugWarn } from "./debug-log";
+import { loadMentalModelsBlock } from "./mental-models";
 import { getHindsightMeta, shouldSessionBeRetained, updateSessionMetadata } from "./meta";
 import { shouldRetainMessage } from "./prepare";
 import { evaluateActiveSessionProjectState, resolveProjectName } from "./project-config";
@@ -50,6 +51,16 @@ let autoRecallDisplayOverride: boolean | null = null;
 // Consumed once per turn by the context handler.
 let lastRecallMessage: ReturnType<typeof formatRecallMessage> | null = null;
 
+// Mental models block for ephemeral injection (opt-in via mentalModelsEnabled).
+// `mentalModelsBlockSource` is fetched once per session_start; the context
+// handler consumes `mentalModelsBlock` once per turn (same consume-once
+// discipline as recall so repeated context events cannot duplicate the
+// injection), and message_end re-arms it from the source for the next turn —
+// mental models are static content, so unlike recall they are re-injected
+// every turn until the next session_start refreshes them.
+let mentalModelsBlock: { content: string; count: number; timestamp: number } | null = null;
+let mentalModelsBlockSource: { content: string; count: number; timestamp: number } | null = null;
+
 // Last recall details for the popup command — persists across turns
 // (not consumed by the context handler like lastRecallMessage is).
 let lastRecallDetails: RecallMessageDetails | null = null;
@@ -71,6 +82,8 @@ export function _resetState(): void {
   lastRecallMessage = null;
   lastRecallDetails = null;
   lastCompatibilityMessage = null;
+  mentalModelsBlock = null;
+  mentalModelsBlockSource = null;
   resetRuntimeState();
   clearProjectNameCache();
 }
@@ -547,6 +560,30 @@ export default function (pi: ExtensionAPI) {
       phase = "refreshing Hindsight tool visibility";
       refreshToolVisibility(pi, shouldSessionBeRetained(entries, config));
 
+      // Opt-in mental models prefetch: fetch the bank's mental models once per
+      // session so the context handler can inject them ephemerally. Best-effort
+      // and non-fatal — failures log to the debug log and simply leave the
+      // block empty (same failure philosophy as auto-recall). Auto-recall tags
+      // are reused for filtering so project-scoped tag setups scope the models
+      // too; placeholder expansion is skipped because session-scoped tags
+      // ({session}/{parent}) would never match a curated model's tags.
+      phase = "prefetching mental models";
+      mentalModelsBlock = null;
+      mentalModelsBlockSource = null;
+      if (config.mentalModelsEnabled && client) {
+        const tags = config.autoRecallTags?.filter((t) => !t.includes("{")) ?? undefined;
+        const block = await loadMentalModelsBlock(
+          client,
+          ctx.signal,
+          tags && tags.length > 0 ? { tags } : {}
+        );
+        if (block) {
+          mentalModelsBlockSource = block;
+          mentalModelsBlock = block;
+          debugLog(prefixLog(`mental models loaded: ${block.count} model(s)`));
+        }
+      }
+
       // On startup, optionally flush pending work across all sessions. This is
       // reason-gated to `session_start` only — it is a best-effort cleanup of old
       // pending sessions, not a readiness prerequisite.
@@ -686,6 +723,12 @@ ${details}`)
     // Consume once so repeated context events cannot duplicate persistence or injection.
     const cachedRecall = lastRecallMessage;
     lastRecallMessage = null; // Clear after reading (consume once per turn)
+
+    // Mental models: consume once per turn, then re-arm from the per-session
+    // source on message_end (static content, re-injected every turn).
+    const cachedMentalModels = mentalModelsBlock;
+    mentalModelsBlock = null;
+
     if (cachedRecall) {
       lastRecallDetails = cachedRecall.details;
       if (config.autoRecallPersist) {
@@ -714,7 +757,32 @@ ${details}`)
         content: recallContent,
         timestamp: cachedRecall.timestamp,
       };
+      if (cachedMentalModels) {
+        const modelsMessage: Record<string, unknown> = {
+          role: config.autoRecallRole,
+          content:
+            config.autoRecallRole === "assistant"
+              ? [{ type: "text", text: cachedMentalModels.content }]
+              : cachedMentalModels.content,
+          timestamp: cachedMentalModels.timestamp,
+        };
+        return {
+          messages: [...filteredMessages, modelsMessage, recallMessage],
+        } as Record<string, unknown>;
+      }
       return { messages: [...filteredMessages, recallMessage] } as Record<string, unknown>;
+    }
+
+    if (cachedMentalModels) {
+      const modelsMessage: Record<string, unknown> = {
+        role: config.autoRecallRole,
+        content:
+          config.autoRecallRole === "assistant"
+            ? [{ type: "text", text: cachedMentalModels.content }]
+            : cachedMentalModels.content,
+        timestamp: cachedMentalModels.timestamp,
+      };
+      return { messages: [...filteredMessages, modelsMessage] } as Record<string, unknown>;
     }
 
     // If we filtered out recall messages but didn't re-inject, return filtered array
@@ -725,6 +793,12 @@ ${details}`)
 
   // Mark sessions as dirty on message_end event
   pi.on("message_end", async (event, ctx: ExtensionContext) => {
+    // Re-arm the mental models block for the next turn (before any early
+    // returns — the re-arm must happen even when auto-retain is off).
+    if (mentalModelsBlock === null && mentalModelsBlockSource !== null) {
+      mentalModelsBlock = mentalModelsBlockSource;
+    }
+
     if (!config.autoRetainEnabled || !isOperationalReady()) return;
 
     const sessionId = ctx.sessionManager.getSessionId();

@@ -50,6 +50,7 @@ let activeClientFactory: () => {
   retainBatch: ReturnType<typeof mock>;
   recall: ReturnType<typeof mock>;
   reflect: ReturnType<typeof mock>;
+  listMentalModels: ReturnType<typeof mock>;
 } = () => ({
   healthCheck: mock(() => Promise.resolve({ success: true })),
   getServerVersion: mock(() => Promise.resolve({ success: true, version: "0.9.0" })),
@@ -57,6 +58,7 @@ let activeClientFactory: () => {
   retainBatch: mock(() => Promise.resolve({ success: true })),
   recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
   reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+  listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
 });
 
 // ============================================
@@ -94,6 +96,9 @@ mock.module("../src/client", () => ({
     retainBatch = this.clientMocks.retainBatch;
     recall = this.clientMocks.recall;
     reflect = this.clientMocks.reflect;
+    listMentalModels = this.clientMocks.listMentalModels;
+    getMentalModel = mock(() => Promise.resolve({ success: true, model: null }));
+    refreshMentalModel = mock(() => Promise.resolve({ success: true, operation: null }));
   },
 }));
 
@@ -130,6 +135,7 @@ afterEach(async () => {
     retainBatch: mock(() => Promise.resolve({ success: true })),
     recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
     reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+    listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
   });
 
   restoreEnv();
@@ -323,6 +329,147 @@ describe("real entrypoint bootstrap", () => {
     await handler({ type: "session_start" }, ctx);
 
     expect(ctx.ui.setStatus).toHaveBeenCalledWith("epimetheus", "🧠");
+  });
+
+  it("mental models disabled by default: session_start does not call listMentalModels", async () => {
+    const listMentalModels = mock(() => Promise.resolve({ success: true, items: [] }));
+    const prevFactory = activeClientFactory;
+    activeClientFactory = () => ({
+      ...prevFactory(),
+      listMentalModels,
+    });
+
+    const pi = createMockPi();
+    const extension = await import("../src/index");
+    extension.default(pi);
+
+    await runHealthySessionStart(pi);
+
+    expect(listMentalModels).not.toHaveBeenCalled();
+  });
+
+  it("mental models enabled: session_start prefetches and context injects the block every turn", async () => {
+    activeConfig = { ...testConfig, mentalModelsEnabled: true };
+    const listMentalModels = mock(() =>
+      Promise.resolve({
+        success: true,
+        items: [
+          {
+            id: "user-preferences",
+            bank_id: "test-bank",
+            name: "User Preferences",
+            content: "Prefers uv over pip.",
+            tags: [],
+          },
+        ],
+      })
+    );
+    const prevFactory = activeClientFactory;
+    activeClientFactory = () => ({
+      ...prevFactory(),
+      listMentalModels,
+    });
+
+    const pi = createMockPi();
+    const extension = await import("../src/index");
+    extension.default(pi);
+
+    await runHealthySessionStart(pi);
+    expect(listMentalModels).toHaveBeenCalledTimes(1);
+
+    // First context event: models block is injected (after any recall).
+    const contextHandler = pi.handlers.get("context")!;
+    const first = (await contextHandler({ messages: [] }, createMockContext())) as {
+      messages: Array<{ content: string }>;
+    };
+    expect(first.messages.length).toBe(1);
+    expect(first.messages[0]!.content).toContain("<hindsight_mental_models>");
+    expect(first.messages[0]!.content).toContain("Prefers uv over pip.");
+
+    // message_end re-arms the static block for the next turn. Uses the
+    // bootstrap session id so the pending flag it touches is cleaned up by
+    // the shared afterEach (removePendingFlag(BOOTSTRAP_SESSION)).
+    const messageEndHandler = pi.handlers.get("message_end")!;
+    await messageEndHandler(
+      { message: { role: "assistant", content: [{ type: "text", text: "ok" }] } },
+      createMockContext({ _sessionId: BOOTSTRAP_SESSION })
+    );
+
+    const second = (await contextHandler({ messages: [] }, createMockContext())) as {
+      messages: Array<{ content: string }>;
+    };
+    expect(second.messages.length).toBe(1);
+    expect(second.messages[0]!.content).toContain("<hindsight_mental_models>");
+  });
+
+  it("mental models injection coexists with recall injection in the same turn", async () => {
+    activeConfig = { ...testConfig, mentalModelsEnabled: true };
+    const prevFactory = activeClientFactory;
+    activeClientFactory = () => ({
+      ...prevFactory(),
+      listMentalModels: mock(() =>
+        Promise.resolve({
+          success: true,
+          items: [
+            {
+              id: "user-preferences",
+              bank_id: "test-bank",
+              name: "User Preferences",
+              content: "Prefers uv over pip.",
+              tags: [],
+            },
+          ],
+        })
+      ),
+      recall: mock(() =>
+        Promise.resolve({
+          success: true,
+          response: { results: [{ id: "1", text: "Some memory", type: "observation" }] },
+        })
+      ),
+    });
+
+    const pi = createMockPi();
+    const extension = await import("../src/index");
+    extension.default(pi);
+
+    await runHealthySessionStart(pi);
+
+    // Simulate auto-recall caching a message, then fire context.
+    const beforeHandler = pi.handlers.get("before_agent_start")!;
+    await beforeHandler({ prompt: "test query" }, createMockContext());
+
+    const contextHandler = pi.handlers.get("context")!;
+    const result = (await contextHandler({ messages: [] }, createMockContext())) as {
+      messages: Array<{ content: unknown }>;
+    };
+    expect(result.messages.length).toBe(2);
+    // Models block first, then the recall message.
+    expect(String(result.messages[0]!.content)).toContain("<hindsight_mental_models>");
+    expect(String(result.messages[1]!.content)).toContain("<hindsight_memories>");
+  });
+
+  it("mental models fetch failure degrades silently (no injection, no throw)", async () => {
+    activeConfig = { ...testConfig, mentalModelsEnabled: true };
+    const prevFactory = activeClientFactory;
+    activeClientFactory = () => ({
+      ...prevFactory(),
+      listMentalModels: mock(() => Promise.resolve({ success: false, error: "server down" })),
+    });
+
+    const pi = createMockPi();
+    const extension = await import("../src/index");
+    extension.default(pi);
+
+    // Must not throw.
+    await runHealthySessionStart(pi);
+
+    const contextHandler = pi.handlers.get("context")!;
+    const result = (await contextHandler({ messages: [] }, createMockContext())) as
+      | { messages: unknown[] }
+      | undefined;
+    // No injection: context handler returns undefined when nothing changed.
+    expect(result?.messages ?? []).toHaveLength(0);
   });
 
   it("session_start runs flush-pending on startup when autoFlushPendingOn includes startup (no-work stays silent)", async () => {
@@ -691,6 +838,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -715,6 +863,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -741,6 +890,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -769,6 +919,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -795,6 +946,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -818,6 +970,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -848,6 +1001,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
     activeConfig = { ...testConfig, autoFlushPendingOn: ["startup"] };
 
@@ -906,6 +1060,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -954,6 +1109,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -995,6 +1151,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall,
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -1040,6 +1197,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -2958,6 +3116,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -3014,6 +3173,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const sessionDir = mkdtempSync(join(tmpdir(), "epimetheus-recall-reload-"));
@@ -3108,6 +3268,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -3159,6 +3320,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const extension = await import("../src/index");
@@ -3198,6 +3360,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -3240,6 +3403,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -3286,6 +3450,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -3389,6 +3554,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     // Simulate an older Pi without registerEntryRenderer().
@@ -3447,6 +3613,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -3511,6 +3678,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall,
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -3557,6 +3725,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall,
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -3642,6 +3811,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -3699,6 +3869,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -3766,6 +3937,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -3839,6 +4011,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -3924,6 +4097,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -3981,6 +4155,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -4055,6 +4230,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -4130,6 +4306,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -4217,6 +4394,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -4268,6 +4446,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -4316,6 +4495,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -4384,6 +4564,7 @@ describe("real entrypoint bootstrap", () => {
         });
       }),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -4432,6 +4613,7 @@ describe("real entrypoint bootstrap", () => {
         });
       }),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -4486,6 +4668,7 @@ describe("real entrypoint bootstrap", () => {
           });
         }),
         reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+        listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
       });
 
       const pi = createMockPi();
@@ -4537,6 +4720,7 @@ describe("real entrypoint bootstrap", () => {
         });
       }),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -4576,6 +4760,7 @@ describe("real entrypoint bootstrap", () => {
         });
       }),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -4615,6 +4800,7 @@ describe("real entrypoint bootstrap", () => {
         });
       }),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -4677,6 +4863,7 @@ describe("real entrypoint bootstrap", () => {
           });
         }),
         reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+        listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
       });
 
       const pi = createMockPi();
@@ -5421,6 +5608,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -5462,6 +5650,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -5516,6 +5705,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -5574,6 +5764,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -5669,6 +5860,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const extension = await import("../src/index");
@@ -5718,6 +5910,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -5761,6 +5954,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -6077,6 +6271,7 @@ describe("real entrypoint bootstrap", () => {
       retainBatch: mock(() => Promise.resolve({ success: true })),
       recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
 
     const pi = createMockPi();
@@ -6225,6 +6420,7 @@ describe("real entrypoint bootstrap", () => {
           });
         }),
         reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+        listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
       });
 
       const pi = createMockPi();
@@ -6295,6 +6491,7 @@ describe("real entrypoint bootstrap", () => {
         })
       ),
       reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
     });
     activeConfig = { ...testConfig, autoRecallPersist: true };
 

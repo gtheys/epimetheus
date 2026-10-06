@@ -59,6 +59,8 @@ const validConfig: HindsightConfig = {
   requireExtraContextBeforeFlush: false,
   statusUnhealthy: "🤯",
   debug: false,
+  mentalModelsEnabled: false,
+  mentalModelsTimeoutMs: 10_000,
   autoFlushSessionOn: ["switch", "fork", "reload"],
   autoFlushPendingOn: ["quit"],
 };
