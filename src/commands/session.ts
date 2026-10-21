@@ -19,6 +19,7 @@ import {
   getPendingSessionIds,
   hasPendingFlag,
   recoverAllStaleInflightClaims,
+  removePendingFlag,
   toolQueueExists,
 } from "../queue";
 import { flushCurrentSession, flushToolQueue, parseAndUpsertSession } from "../retention";
@@ -134,7 +135,7 @@ function resolveSessionDisplayName(
  * then flush any tool queue entries.
  *
  * Per-session notifications (from `parseAndUpsertSession`, `flushToolQueue`, and
- * the missing-session error below) are prefixed with a `[<id> - <name>]` header
+ * the missing-session warning below) are prefixed with a `[<id> - <name>]` header
  * so the user can tell which session each outcome belongs to. Aggregate
  * flush-pending messages are emitted on the un-wrapped ctx elsewhere.
  */
@@ -169,7 +170,14 @@ async function flushPendingSession(
   // Re-parse and upsert if this session has a pending marker
   if (hasPending) {
     if (!sessionInfo) {
-      prefixedCtx.ui.notify("session file not found", "error");
+      // The session file is gone (session pruned or migrated), so the pending
+      // markers can never be satisfied. Drop them so this session stops
+      // re-erroring on every flush; the tool queue below still flushes because
+      // its entries are independent of the session file.
+      removePendingFlag(sessionId);
+      if (!autoFlush || config.debug) {
+        prefixedCtx.ui.notify("session file not found, removed stale pending markers", "warning");
+      }
     } else {
       await parseAndUpsertSession(
         sessionInfo.path,

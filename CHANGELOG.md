@@ -10,6 +10,8 @@
 
 ### Fixed
 
+- **Stale pending markers** — `flush-pending` no longer re-reports "session file not found" on every flush for sessions whose JSONL was deleted or migrated away: when the session file is missing, the pending markers are removed (downgraded from a recurring error to a one-time warning, suppressed for auto-flush outside debug mode). The tool queue for such sessions still flushes as before.
+
 - **Extension loading warning** — `typebox` moved from `dependencies` to `peerDependencies` (range `*`) so the pi host's copy is used instead of an installed duplicate, silencing the "Host-provided extension packages must be declared in peerDependencies" warning at extension load time.
 
 - **Visible auto-recall failures** — Auto-recall failures now use TUI warning notifications instead of relying only on console warnings that are overwritten during redraw. Failures still inject no memory context and are recorded in the debug log.

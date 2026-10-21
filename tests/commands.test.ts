@@ -1544,10 +1544,9 @@ describe("registerCommands", () => {
       }
     });
 
-    it("reports error when pending session not found", async () => {
-      const { touchPendingFlag, removePendingFlag, clearSessionQueueState } = await import(
-        "../src/queue"
-      );
+    it("removes stale pending markers when session file is missing", async () => {
+      const { touchPendingFlag, removePendingFlag, clearSessionQueueState, hasPendingFlag } =
+        await import("../src/queue");
       const sessionId = `test-missing-session-${Date.now()}`;
       try {
         await touchPendingFlag(sessionId);
@@ -1555,9 +1554,12 @@ describe("registerCommands", () => {
         register();
         await getHandler()("flush-pending", makeCtx());
 
-        // Per-session notification includes the session ID and reason
+        // Manual flush surfaces the per-session warning including the session ID
         expect(lastNotification?.message).toContain(sessionId);
         expect(lastNotification?.message).toContain("session file not found");
+        expect(lastNotification?.type).toBe("warning");
+        // Stale markers are dropped so the session is not re-reported forever
+        expect(hasPendingFlag(sessionId)).toBe(false);
         // No final summary notification
       } finally {
         removePendingFlag(sessionId);
@@ -1584,7 +1586,7 @@ describe("registerCommands", () => {
         register();
         await getHandler()("flush-pending", makeCtx());
 
-        // Per-session error notification for missing session file
+        // Per-session stale-marker warning for missing session file
         // (may be overwritten by subsequent tool queue notification)
         // Tool queue should still have been flushed
         expect(mockClient!.retainBatch).toHaveBeenCalled();
@@ -1823,10 +1825,9 @@ describe("registerCommands", () => {
 
     it("falls back to 'Untitled' in the per-session prefix when name is missing", async () => {
       // Missing session (no session file in the map): the prefix still carries
-      // the session id and uses 'Untitled', with the error body on the next line.
-      const { touchPendingFlag, removePendingFlag, clearSessionQueueState } = await import(
-        "../src/queue"
-      );
+      // the session id and uses 'Untitled', with the warning body on the next line.
+      const { touchPendingFlag, removePendingFlag, clearSessionQueueState, hasPendingFlag } =
+        await import("../src/queue");
       const sessionId = `test-flp-prefix-untitled-${Date.now()}`;
       try {
         await touchPendingFlag(sessionId);
@@ -1848,11 +1849,13 @@ describe("registerCommands", () => {
         register();
         await getHandler()("flush-pending", ctx);
 
-        const errored = notifyHistory.find((n) => n.message.includes("session file not found"));
-        expect(errored).toBeDefined();
-        expect(errored!.message.startsWith(`[${sessionId} - Untitled]\n`)).toBe(true);
-        expect(errored!.message).toContain("session file not found");
-        expect(errored!.type).toBe("error");
+        const warned = notifyHistory.find((n) => n.message.includes("session file not found"));
+        expect(warned).toBeDefined();
+        expect(warned!.message.startsWith(`[${sessionId} - Untitled]\n`)).toBe(true);
+        expect(warned!.message).toContain("session file not found");
+        expect(warned!.type).toBe("warning");
+        // Stale markers are dropped, not just reported
+        expect(hasPendingFlag(sessionId)).toBe(false);
       } finally {
         removePendingFlag(sessionId);
         clearSessionQueueState(sessionId);
