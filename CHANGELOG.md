@@ -10,6 +10,8 @@
 
 ### Fixed
 
+- **Auto-recall circuit breaker** — Auto-recall no longer pays a full recall timeout (plus a TUI warning) on every turn when the Hindsight server dies mid-session: after 3 consecutive failures a circuit breaker trips, skips the recall call entirely (zero added latency), and emits exactly one warning instead of one per turn. While tripped, one probe per minute detects recovery — a successful probe re-arms auto-recall without a session restart and any successful recall resets the failure count. The `hindsight_recall` tool, the per-failure warnings before the breaker trips, and the session-start degraded path are unchanged.
+
 - **Stale pending markers** — `flush-pending` no longer re-reports "session file not found" on every flush for sessions whose JSONL was deleted or migrated away: when the session file is missing, the pending markers are removed (downgraded from a recurring error to a one-time warning, suppressed for auto-flush outside debug mode). The tool queue for such sessions still flushes as before.
 
 - **Extension loading warning** — `typebox` moved from `dependencies` to `peerDependencies` (range `*`) so the pi host's copy is used instead of an installed duplicate, silencing the "Host-provided extension packages must be declared in peerDependencies" warning at extension load time.

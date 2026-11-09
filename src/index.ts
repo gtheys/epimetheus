@@ -68,6 +68,25 @@ let lastRecallDetails: RecallMessageDetails | null = null;
 // Track the last compatibility warning so we don't spam session_start events.
 let lastCompatibilityMessage: string | null = null;
 
+// Auto-recall circuit breaker: consecutive recall failures plus the time of
+// the most recent one. Trips after AUTO_RECALL_FAILURE_THRESHOLD consecutive
+// failures — while tripped, before_agent_start skips the recall endpoint
+// entirely (zero added latency) except for one probe per
+// AUTO_RECALL_PROBE_INTERVAL_MS, so a Hindsight server that dies mid-session
+// no longer costs a full recallTimeoutMs delay and a TUI warning on every
+// turn. Any non-error recall result (including no results) resets the counter.
+// AIDEV-NOTE: operational readiness latches at session_start and cannot see
+// mid-session server death — this breaker is the only mid-session guard, so
+// before_agent_start must consult it before every recall call.
+let autoRecallFailures = 0;
+let autoRecallLastFailureAt = 0;
+
+/** Consecutive auto-recall failures before the circuit breaker trips. */
+const AUTO_RECALL_FAILURE_THRESHOLD = 3;
+
+/** Minimum ms between recall probes while the circuit breaker is tripped. */
+const AUTO_RECALL_PROBE_INTERVAL_MS = 60_000;
+
 /**
  * Reset module-level mutable state. Exported for testing only.
  *
@@ -84,6 +103,8 @@ export function _resetState(): void {
   lastCompatibilityMessage = null;
   mentalModelsBlock = null;
   mentalModelsBlockSource = null;
+  autoRecallFailures = 0;
+  autoRecallLastFailureAt = 0;
   resetRuntimeState();
   clearProjectNameCache();
 }
@@ -664,6 +685,16 @@ ${details}`)
     const query = event.prompt;
     if (!query) return;
 
+    // Circuit breaker: once tripped, skip the recall call (and its timeout)
+    // except for one probe per interval so a recovered server re-arms recall
+    // without a session restart.
+    if (
+      autoRecallFailures >= AUTO_RECALL_FAILURE_THRESHOLD &&
+      Date.now() - autoRecallLastFailureAt < AUTO_RECALL_PROBE_INTERVAL_MS
+    ) {
+      return;
+    }
+
     // Call shared recall helper
     const header = ctx.sessionManager.getHeader();
     const sessionId = ctx.sessionManager.getSessionId();
@@ -698,12 +729,33 @@ ${details}`)
       parentSessionId
     );
     if (result?.error) {
-      ctx.ui.notify(prefixLog(`auto-recall failed: ${result.error}`), "warning");
-    } else if (result?.recallMessage) {
-      lastRecallMessage = result.recallMessage;
-      lastRecallDetails = result.recallMessage.details;
-      // The context handler consumes this cache, optionally persists its display
-      // details, and injects its fenced content for the current turn.
+      autoRecallFailures += 1;
+      autoRecallLastFailureAt = Date.now();
+      if (autoRecallFailures < AUTO_RECALL_FAILURE_THRESHOLD) {
+        ctx.ui.notify(prefixLog(`auto-recall failed: ${result.error}`), "warning");
+      } else if (autoRecallFailures === AUTO_RECALL_FAILURE_THRESHOLD) {
+        // Warn once on the transition into the broken state, not per turn;
+        // probe failures past the threshold stay debug-only (logged in
+        // doAutoRecallImpl) to avoid re-warning every probe.
+        ctx.ui.notify(
+          prefixLog(
+            `auto-recall disabled after ${AUTO_RECALL_FAILURE_THRESHOLD} consecutive failures (retrying every ${
+              AUTO_RECALL_PROBE_INTERVAL_MS / 1000
+            }s)`
+          ),
+          "warning"
+        );
+        debugWarn(prefixLog(`auto-recall circuit breaker open: ${result.error}`));
+      }
+    } else {
+      // Success (or no results): re-arm the circuit breaker.
+      autoRecallFailures = 0;
+      if (result?.recallMessage) {
+        lastRecallMessage = result.recallMessage;
+        lastRecallDetails = result.recallMessage.details;
+        // The context handler consumes this cache, optionally persists its display
+        // details, and injects its fenced content for the current turn.
+      }
     }
   });
 

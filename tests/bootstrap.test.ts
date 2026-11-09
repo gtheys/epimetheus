@@ -7,7 +7,7 @@
  * sets those variables before importing/exercising the extension.
  */
 
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, setSystemTime } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -3707,6 +3707,158 @@ describe("real entrypoint bootstrap", () => {
         (message) => typeof message.content === "string" && message.content.includes("Stale memory")
       )
     ).toBe(false);
+  });
+
+  it("stops auto-recall and warns once after three consecutive failures", async () => {
+    const recall = mock(() =>
+      Promise.resolve({ success: false, error: "Operation timed out after 10000ms" })
+    );
+    activeClientFactory = () => ({
+      healthCheck: mock(() => Promise.resolve({ success: true })),
+      retain: mock(() => Promise.resolve({ success: true })),
+      retainBatch: mock(() => Promise.resolve({ success: true })),
+      recall,
+      reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+      listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
+    });
+
+    const pi = createMockPi();
+    const extension = await import("../src/index");
+    extension.default(pi);
+    await runHealthySessionStart(pi);
+
+    const ctx = createMockContext();
+    const beforeAgentStart = pi.handlers.get("before_agent_start")!;
+    for (const prompt of ["First", "Second", "Third", "Fourth"]) {
+      await beforeAgentStart({ type: "before_agent_start", prompt }, ctx);
+    }
+
+    // The fourth turn never reaches the recall endpoint.
+    expect(recall).toHaveBeenCalledTimes(3);
+    const warnings = (ctx.ui.notify as ReturnType<typeof mock>).mock.calls.filter(
+      (call) => call[1] === "warning"
+    );
+    expect(warnings).toEqual([
+      ["epimetheus: auto-recall failed: Operation timed out after 10000ms", "warning"],
+      ["epimetheus: auto-recall failed: Operation timed out after 10000ms", "warning"],
+      [
+        "epimetheus: auto-recall disabled after 3 consecutive failures (retrying every 60s)",
+        "warning",
+      ],
+    ]);
+  });
+
+  it("probes once per interval while tripped and stays quiet when the probe fails", async () => {
+    const realNow = Date.now();
+    setSystemTime(new Date(realNow));
+    try {
+      const recall = mock(() =>
+        Promise.resolve({ success: false, error: "Operation timed out after 10000ms" })
+      );
+      activeClientFactory = () => ({
+        healthCheck: mock(() => Promise.resolve({ success: true })),
+        retain: mock(() => Promise.resolve({ success: true })),
+        retainBatch: mock(() => Promise.resolve({ success: true })),
+        recall,
+        reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+        listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
+      });
+
+      const pi = createMockPi();
+      const extension = await import("../src/index");
+      extension.default(pi);
+      await runHealthySessionStart(pi);
+
+      const ctx = createMockContext();
+      const beforeAgentStart = pi.handlers.get("before_agent_start")!;
+      for (const prompt of ["First", "Second", "Third"]) {
+        await beforeAgentStart({ type: "before_agent_start", prompt }, ctx);
+      }
+      expect(recall).toHaveBeenCalledTimes(3);
+      const tripWarnings = (ctx.ui.notify as ReturnType<typeof mock>).mock.calls.length;
+
+      // Within the probe interval: no call at all.
+      await beforeAgentStart({ type: "before_agent_start", prompt: "Too soon" }, ctx);
+      expect(recall).toHaveBeenCalledTimes(3);
+
+      // After the interval: exactly one probe, and a failing probe does not
+      // re-warn (the trip warning already fired).
+      setSystemTime(new Date(realNow + 61_000));
+      await beforeAgentStart({ type: "before_agent_start", prompt: "Probe" }, ctx);
+      expect(recall).toHaveBeenCalledTimes(4);
+      expect((ctx.ui.notify as ReturnType<typeof mock>).mock.calls.length).toBe(tripWarnings);
+
+      // Still tripped: the next immediate turn is skipped again.
+      await beforeAgentStart({ type: "before_agent_start", prompt: "Skipped" }, ctx);
+      expect(recall).toHaveBeenCalledTimes(4);
+    } finally {
+      setSystemTime(new Date(realNow));
+    }
+  });
+
+  it("re-arms auto-recall when a probe succeeds and resets the failure count", async () => {
+    const realNow = Date.now();
+    setSystemTime(new Date(realNow));
+    try {
+      const recall = mock()
+        .mockResolvedValueOnce({ success: false, error: "fail 1" })
+        .mockResolvedValueOnce({ success: false, error: "fail 2" })
+        .mockResolvedValueOnce({ success: false, error: "fail 3" })
+        .mockResolvedValueOnce({
+          success: true,
+          response: { results: [{ id: "1", text: "Recovered memory" }] },
+        })
+        .mockResolvedValueOnce({
+          success: true,
+          response: { results: [{ id: "2", text: "Next turn memory" }] },
+        })
+        .mockResolvedValueOnce({ success: false, error: "fail 4" });
+      activeClientFactory = () => ({
+        healthCheck: mock(() => Promise.resolve({ success: true })),
+        retain: mock(() => Promise.resolve({ success: true })),
+        retainBatch: mock(() => Promise.resolve({ success: true })),
+        recall,
+        reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+        listMentalModels: mock(() => Promise.resolve({ success: true, items: [] })),
+      });
+
+      const pi = createMockPi();
+      const extension = await import("../src/index");
+      extension.default(pi);
+      await runHealthySessionStart(pi);
+
+      const ctx = createMockContext();
+      const beforeAgentStart = pi.handlers.get("before_agent_start")!;
+      for (const prompt of ["First", "Second", "Third"]) {
+        await beforeAgentStart({ type: "before_agent_start", prompt }, ctx);
+      }
+      expect(recall).toHaveBeenCalledTimes(3);
+
+      // The successful probe both re-arms the breaker and provides this
+      // turn's recall.
+      setSystemTime(new Date(realNow + 61_000));
+      await beforeAgentStart({ type: "before_agent_start", prompt: "Probe" }, ctx);
+      expect(recall).toHaveBeenCalledTimes(4);
+
+      // Re-armed: the next turn recalls without waiting for another probe.
+      await beforeAgentStart({ type: "before_agent_start", prompt: "Next" }, ctx);
+      expect(recall).toHaveBeenCalledTimes(5);
+
+      // The counter restarted at the probe success, so one later failure is
+      // just a regular per-failure warning, not a second trip.
+      await beforeAgentStart({ type: "before_agent_start", prompt: "Failing" }, ctx);
+      expect(recall).toHaveBeenCalledTimes(6);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        "epimetheus: auto-recall failed: fail 4",
+        "warning"
+      );
+      const tripWarnings = (ctx.ui.notify as ReturnType<typeof mock>).mock.calls.filter(
+        (call) => typeof call[0] === "string" && call[0].includes("auto-recall disabled")
+      );
+      expect(tripWarnings).toHaveLength(1);
+    } finally {
+      setSystemTime(new Date(realNow));
+    }
   });
 
   it("before_agent_start performs recall on first message of session", async () => {
